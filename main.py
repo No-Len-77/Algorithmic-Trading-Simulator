@@ -50,7 +50,7 @@ from app.core.database import (
     check_database_connection,
     create_tables,
     dispose_engines,
-    init_database,
+    wait_for_database,
 )
 from app.core.logger import logger
 from app.infra.redis_client import close_redis, init_redis
@@ -140,9 +140,18 @@ async def lifespan(app: FastAPI):
     # (audit 6.2). Alembic migrations are the source of truth — run
     # `alembic upgrade head` before deploy.
     # ---------------------------------------------------------------------
-    await asyncio.to_thread(init_database)
-    if not await check_database_connection():
-        raise RuntimeError("Database connectivity check failed")
+    # Wait, with backoff, rather than probing once. A managed database that is
+    # restarting or waking from idle refuses connections for tens of seconds;
+    # a single probe turns that into a dead service the platform never retries.
+    # Once the grace window is spent we still fail fast — an instance that
+    # cannot reach its database must not take traffic.
+    if not await wait_for_database():
+        raise RuntimeError(
+            "Database connectivity check failed after "
+            f"{settings.database_startup_timeout:.0f}s — check DATABASE_URL and "
+            "that the database instance is running (a suspended free-tier "
+            "instance never answers; see DEPLOY.md)"
+        )
     logger.info("[startup] database ready")
     if settings.is_development and settings.database_url.startswith("sqlite"):
         # Dev convenience: bootstrap schema for the local SQLite file

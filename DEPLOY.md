@@ -16,7 +16,7 @@ zero cross-origin configuration.
                          └───────────────┬───────────┬──────────┘
                                          │           │
                               ┌──────────▼──┐   ┌────▼────────┐
-                              │ hft-db      │   │ hft-redis   │
+                              │ hft-postgres│   │ hft-redis   │
                               │ PostgreSQL  │   │ Key Value   │
                               └─────────────┘   └─────────────┘
 ```
@@ -33,7 +33,7 @@ resources at once.
    **Blueprint**.
 3. Connect the repository **`Akshatx-io/Algorithmic-Trading-Simulator`** and
    select the branch. Render detects `render.yaml`.
-4. Review the plan (3 free resources: `hft-db`, `hft-redis`, `algorithmic-trading-simulator`) and
+4. Review the plan (3 free resources: `hft-postgres`, `hft-redis`, `algorithmic-trading-simulator`) and
    click **Apply**.
 5. Wait for the first build (~4–7 min: it builds the SPA, installs Python deps,
    then runs `alembic upgrade head` on boot). When `algorithmic-trading-simulator` is **Live**,
@@ -50,7 +50,7 @@ That's it — click **"Explore the live demo"** for a one-click populated accoun
 
 Create the three resources by hand, in this order, all in the **same region**:
 
-1. **PostgreSQL** — New → Postgres → name `hft-db`, plan **Free** → Create. Copy
+1. **PostgreSQL** — New → Postgres → name `hft-postgres`, plan **Free** → Create. Copy
    the **Internal Database URL**.
 2. **Key Value (Redis)** — New → Key Value → name `hft-redis`, plan **Free**,
    *Maxmemory policy* `allkeys-lru` → Create. Copy the **Internal URL**.
@@ -69,7 +69,7 @@ Create the three resources by hand, in this order, all in the **same region**:
 |---|---|---|
 | `ENVIRONMENT` | `production` | Enables prod guards (real Redis, strong JWT). |
 | `JWT_SECRET_KEY` | *(generate)* | Must be **≥ 32 chars**. Blueprint uses `generateValue`. Manually: `openssl rand -hex 32`. |
-| `DATABASE_URL` | *from `hft-db`* | The app coerces `postgres://` → `postgresql://` automatically. |
+| `DATABASE_URL` | *from `hft-postgres`* | The app coerces `postgres://` → `postgresql://` automatically. |
 | `REDIS_URL` | *from `hft-redis`* | Internal `redis://…` URL. |
 | `ALLOWED_HOSTS` | `["*.onrender.com", "localhost", "127.0.0.1"]` | **JSON array** (the app JSON-parses list envs — *not* comma-separated). The `*.onrender.com` wildcard accepts the service subdomain (even if Render suffixes it); `localhost`/`127.0.0.1` keep the health probes passing. |
 | `USE_SYNTHETIC_MARKET` | `true` | Deterministic 24/7 market; no external data deps. |
@@ -126,15 +126,26 @@ production uses managed Postgres + Redis.)*
 
 - **Free tier sleeps.** A free Render web service spins down after ~15 min idle;
   the first request then cold-starts (~30–60 s). Fine for a demo.
-- **Free Postgres expires.** Render's free Postgres is time-limited (~30 days);
-  recreate it (and re-apply the blueprint) when it lapses.
+- **Free Postgres expires.** Render's free Postgres is time-limited (~30 days),
+  after which the dashboard shows **"Suspended by Render"**. A suspended free
+  instance cannot be resumed — see
+  [Recovering from a suspended database](#recovering-from-a-suspended-database).
 - **Single worker by design.** The container starts one uvicorn worker (the
   start command is inlined in `Dockerfile.web`) — the background
   market/candle/signal engines live in the FastAPI lifespan, so multiple
   workers would duplicate them. Scale vertically, not by workers.
 - **Migrations run on boot.** The `Dockerfile.web` start command runs
-  `alembic upgrade head`, falling back to `Base.metadata.create_all` if a
-  migration fails, so a valid schema is always present — no manual step.
+  `python -m app.core.db_bootstrap`, which waits for the database, adopts a
+  pre-Alembic schema by stamping `0001_baseline` once (databases built by the
+  old `create_all` fallback have no `alembic_version` row, so `upgrade head`
+  would otherwise fail on `DuplicateTable` every boot), then runs
+  `alembic upgrade head` — still falling back to `Base.metadata.create_all` if
+  that fails. A valid schema is always present, with no manual step.
+- **Startup waits for the database.** Both the bootstrap and the app lifespan
+  retry with backoff for `DATABASE_STARTUP_TIMEOUT` seconds (default `90`)
+  before giving up, so a database that is restarting or waking from idle no
+  longer turns into a permanently failed service. Once the window is spent the
+  app still exits — an instance that cannot reach its database must not serve.
 - **Host allow-listing is already on.** The blueprint sets
   `ALLOWED_HOSTS=["*.onrender.com", "localhost", "127.0.0.1"]`, which accepts
   your service subdomain (even if Render appends a suffix) plus the health
@@ -143,6 +154,58 @@ production uses managed Postgres + Redis.)*
 - **One-click guest demo.** Visitors can hit **"Explore the live demo"** on the
   login page (`POST /api/v1/auth/demo`) to land in a freshly-seeded, populated
   account — no signup. The demo account is sandboxed and reset on each use.
+
+---
+
+## Recovering from a suspended database
+
+Symptom, in the Render dashboard:
+
+| Service | Status |
+| --- | --- |
+| `hft-postgres` | **Suspended by Render** |
+| `algorithmic-trading-simulator` | **Failed service** |
+
+The web service is failed *because of* the database, not independently: the
+free Postgres passed its 30-day limit and stopped accepting connections, and
+the app refuses to boot without one (by design — an instance that cannot reach
+its database must not take traffic). Logs show
+`Database connectivity check failed`.
+
+A free instance in this state cannot be resumed or restored; Render's own
+recovery path is to replace it. Any data in it is gone — for this demo that is
+only user accounts and simulated trades, which the schema bootstrap and the
+guest-demo seeder recreate.
+
+1. **Export anything you need first.** Dashboard → `hft-postgres` → *Backups*
+   (the free plan offers no automated backups, so there may be nothing there).
+   Skip this step if the demo data is disposable — it normally is.
+2. **Delete the suspended instance.** Dashboard → `hft-postgres` → *Settings* →
+   *Delete Database*. Render allows only one free Postgres per workspace, so
+   the replacement cannot be created until this one is gone.
+3. **Re-sync the blueprint.** Dashboard → *Blueprints* → your blueprint →
+   **Sync**. `render.yaml` recreates `hft-postgres` and rewires the web
+   service's `DATABASE_URL` to it automatically.
+
+   > If you provisioned manually (Option B), instead create a new Postgres,
+   > copy its **Internal Database URL**, and set it as `DATABASE_URL` on the
+   > web service.
+
+4. **Redeploy the web service** (*Manual Deploy → Deploy latest commit*) if the
+   sync did not trigger one. On boot, `db_bootstrap` finds an empty database
+   and runs `alembic upgrade head` to build the schema from scratch.
+5. **Verify:**
+
+   ```bash
+   curl https://algorithmic-trading-simulator.onrender.com/health
+   # -> {"status":"healthy","database":"connected",...}
+   ```
+
+**Keep the name in sync.** The blueprint's database name must match the
+instance in the dashboard. `render.yaml` declared `hft-db` while the live
+instance was `hft-postgres`; every sync therefore tried to create a *second*
+free Postgres, which Render refuses, so the web service was never rewired.
+Both now read `hft-postgres`.
 
 ---
 

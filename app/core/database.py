@@ -15,6 +15,8 @@ Phase 2.2:
 
 from __future__ import annotations
 
+import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Iterator
 
@@ -109,7 +111,11 @@ async def async_session_context() -> AsyncIterator[AsyncSession]:
 # Lifecycle helpers
 # ---------------------------------------------------------------------------
 def init_database() -> None:
-    """Sync connectivity probe used by main.py startup."""
+    """Sync connectivity probe (single attempt, raises on failure).
+
+    Startup uses `wait_for_database` instead, which retries; this stays for
+    scripts and admin tooling that want an immediate pass/fail.
+    """
     try:
         with sync_engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -128,6 +134,65 @@ async def check_database_connection() -> bool:
     except Exception:
         logger.exception("[db] async ping failed")
         return False
+
+
+async def wait_for_database(
+    timeout: float | None = None,
+    max_delay: float = 8.0,
+) -> bool:
+    """Poll the database until it accepts a connection, or `timeout` elapses.
+
+    Returns True as soon as a ``SELECT 1`` succeeds, False if the whole grace
+    window passes without one.
+
+    Why this exists: a single probe at startup conflates "the database is
+    gone" with "the database has not finished waking up". A managed Postgres
+    that is restarting, being resized, or cold-starting after idle refuses
+    connections for tens of seconds, and a process that dies on the first
+    refusal never sees it come back — the platform reports a failed service
+    for an outage that healed on its own. Retrying with backoff distinguishes
+    the two, while still failing fast (see main.py) once the window is spent.
+
+    Unlike `check_database_connection`, intermediate failures are logged at
+    warning level without a traceback: a refused connection during boot is
+    expected, not exceptional. The final failure is logged with the reason.
+    """
+    if timeout is None:
+        timeout = settings.database_startup_timeout
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    delay = 1.0
+    attempt = 0
+    last_error: Exception | None = None
+
+    while True:
+        attempt += 1
+        try:
+            async with async_engine.begin() as conn:
+                await conn.execute(text("SELECT 1"))
+            if attempt > 1:
+                logger.info("[db] reachable after {} attempt(s)", attempt)
+            return True
+        # Broad by design: during boot, any failure to connect — refused,
+        # DNS not resolving yet, auth not provisioned — means "not ready yet".
+        except Exception as exc:
+            last_error = exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait = min(delay, max_delay, remaining)
+            logger.warning(
+                "[db] not ready (attempt {}): {} — retrying in {:.1f}s",
+                attempt, exc.__class__.__name__, wait,
+            )
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, max_delay)
+
+    logger.error(
+        "[db] unreachable after {:.0f}s / {} attempt(s): {}",
+        timeout, attempt, last_error,
+    )
+    return False
 
 
 def create_tables() -> None:

@@ -74,6 +74,13 @@ class Settings(BaseSettings):
     database_max_overflow:  int = 20
     database_pool_pre_ping: bool = True
     database_echo:          bool = False
+    # Grace window (seconds) that startup will spend waiting for the database
+    # to answer before giving up. A managed Postgres that is restarting, being
+    # resized, or waking from idle can take tens of seconds to accept
+    # connections; without a wait the very first probe fails and the platform
+    # marks the whole service failed, even though the database returns
+    # moments later. 0 disables the wait (single probe, previous behaviour).
+    database_startup_timeout: float = 90.0
 
     # -------------------------------------------------------------------------
     # Redis

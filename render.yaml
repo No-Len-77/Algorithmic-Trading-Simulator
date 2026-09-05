@@ -2,9 +2,9 @@
 # Render Blueprint — one-click public deploy.
 #
 # Provisions three resources in one region:
-#   • hft-db       — managed PostgreSQL 16   (free plan)
+#   • hft-postgres — managed PostgreSQL 18   (free plan, expires after 30d)
 #   • hft-redis    — managed Key Value/Redis (free plan, internal-only)
-#   • hft-terminal — the web service (Docker), serving SPA + API + WebSocket
+#   • algorithmic-trading-simulator — web service (Docker): SPA + API + WebSocket
 #                    same-origin via Dockerfile.web.
 #
 # Deploy:  Render Dashboard → New → Blueprint → pick this repo.
@@ -12,11 +12,23 @@
 # =============================================================================
 
 databases:
-  - name: hft-db
+  # NOTE: this name must match the instance that already exists in the Render
+  # dashboard. It read `hft-db` while the live instance was `hft-postgres`, so
+  # each blueprint sync tried to create a *second* free Postgres — which Render
+  # refuses (one free instance per workspace) — and the web service kept its
+  # stale DATABASE_URL instead of being rewired.
+  #
+  # Free Postgres instances EXPIRE 30 days after creation and are then
+  # "Suspended by Render". A suspended instance cannot be resumed: delete it
+  # and re-sync this blueprint, which recreates the database and rewires
+  # DATABASE_URL below automatically. See DEPLOY.md §
+  # "Recovering from a suspended database".
+  - name: hft-postgres
     plan: free
     databaseName: hft
     user: hft
     region: oregon
+    postgresMajorVersion: "18"
 
 services:
   # ---- Managed Redis (Key Value) ----
@@ -46,7 +58,7 @@ services:
       # Postgres connection string (coerced postgres:// -> postgresql:// in app).
       - key: DATABASE_URL
         fromDatabase:
-          name: hft-db
+          name: hft-postgres
           property: connectionString
       # Redis connection string from the Key Value instance above.
       - key: REDIS_URL

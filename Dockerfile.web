@@ -77,12 +77,24 @@ RUN mkdir -p /app/logs && chown -R hft:hft /app
 USER hft
 EXPOSE 8000
 
+# Liveness, not readiness: /health does a database round-trip, so pointing the
+# container probe at it lets a database blip kill the very process that would
+# have recovered from it. /health/live answers "is this process alive?".
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-    CMD curl -fsS "http://localhost:${PORT:-8000}/health" || exit 1
+    CMD curl -fsS "http://localhost:${PORT:-8000}/health/live" || exit 1
 
 # tini = PID 1 signal forwarding (graceful asyncio shutdown).
 ENTRYPOINT ["tini", "--"]
-# Inlined (not scripts/start.sh) so the start command never depends on a file's
-# line endings — a CRLF-terminated shell script would exit 1 on boot. Runs the
-# migrations, then hands PID to uvicorn on the platform-provided $PORT.
-CMD ["sh", "-c", "alembic upgrade head || python -c 'from app.models import Base; from app.core.database import sync_engine; Base.metadata.create_all(bind=sync_engine)'; exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips '*'"]
+# Schema first, then hand PID to uvicorn on the platform-provided $PORT.
+#
+# `python -m app.core.db_bootstrap` replaces the previous inline
+# `alembic upgrade head || create_all`. That fallback could never adopt
+# migrations: production's tables were built by create_all and carry no
+# alembic_version row, so the baseline revision hit DuplicateTable and fell
+# through to create_all on every single boot. The module waits for the
+# database, stamps the baseline once to adopt a create_all-built schema, then
+# upgrades to head — and still falls back to create_all if that fails.
+#
+# A Python module, not scripts/start.sh: Python is indifferent to CRLF line
+# endings, whereas a CRLF-terminated shell script exits 1 on boot.
+CMD ["sh", "-c", "python -m app.core.db_bootstrap; exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips '*'"]
